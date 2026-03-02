@@ -199,12 +199,26 @@ async def is_registered(user_id: int) -> bool:
 
 
 async def is_admin(interaction: discord.Interaction) -> bool:
+    # Must be used in a server
     if not interaction.guild:
         return False
-    member = interaction.guild.get_member(interaction.user.id)
-    if not member:
-        return False
-    return any(r.name == ADMIN_ROLE for r in member.roles)
+
+    # Prefer the interaction user object (usually a discord.Member with roles)
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+
+    # If not a Member (rare), fetch from API (works even without member cache)
+    if member is None:
+        try:
+            member = await interaction.guild.fetch_member(interaction.user.id)
+        except Exception:
+            return False
+
+    # If you want: allow server admins too (optional)
+    if getattr(member, "guild_permissions", None) and member.guild_permissions.administrator:
+        return True
+
+    # Role-name based check
+    return any(getattr(r, "name", "") == ADMIN_ROLE for r in getattr(member, "roles", []))
 
 
 async def event_locked(season: int, round_: int, session: str) -> bool:
@@ -728,5 +742,6 @@ async def preseason_board(interaction: discord.Interaction, season: int, categor
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
+
 
 client.run(DISCORD_TOKEN)
