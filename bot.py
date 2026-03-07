@@ -14,17 +14,30 @@ from discord import app_commands
 # =======================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 ADMIN_ROLE = os.getenv("ADMIN_ROLE", "LeagueAdmin")
-LEADERBOARD_CHANNEL_ID = os.getenv("LEADERBOARD_CHANNEL_ID")  # optional
+REMINDER_ROLE = os.getenv("REMINDER_ROLE", "FantasyPlayer")
+
+LEADERBOARD_CHANNEL_ID = int(os.getenv("LEADERBOARD_CHANNEL_ID")) if os.getenv("LEADERBOARD_CHANNEL_ID") else None
+REMINDER_CHANNEL_ID = int(os.getenv("REMINDER_CHANNEL_ID")) if os.getenv("REMINDER_CHANNEL_ID") else None
+GUILD_ID = int(os.getenv("GUILD_ID")) if os.getenv("GUILD_ID") else None
+
 JOLPICA_BASE = os.getenv("JOLPICA_BASE", "https://api.jolpi.ca/ergast/f1")
-DB_PATH = "f1fantasy.db"
+DB_PATH = os.getenv("DB_PATH", "f1fantasy.db")
+
+LEAGUE_SEASON = int(os.getenv("LEAGUE_SEASON", "2026"))
 
 BDT = ZoneInfo("Asia/Dhaka")
-# Preseason lock: March 5, 2026 11:59 PM BDT
 PRESEASON_LOCK_BDT = datetime(2026, 3, 5, 23, 59, 0, tzinfo=BDT)
 PRESEASON_LOCK_UTC = PRESEASON_LOCK_BDT.astimezone(timezone.utc)
 
 SESSIONS = ("quali", "race")
-SESSION_RESULT_DELAY = {"quali": timedelta(hours=2), "race": timedelta(hours=4)}
+SESSION_RESULT_DELAY = {
+    "quali": timedelta(hours=2),
+    "race": timedelta(hours=4),
+}
+
+PRESEASON_REMINDER_BEFORE = timedelta(hours=24)
+QUALI_REMINDER_BEFORE = timedelta(hours=24)
+RACE_REMINDER_BEFORE = timedelta(hours=12)
 
 
 # =======================
@@ -43,8 +56,7 @@ def from_iso(s: str) -> datetime:
 
 
 def parse_list(text: str) -> List[str]:
-    raw = [x.strip().upper() for x in text.replace("\n", " ").replace(",", " ").split(" ") if x.strip()]
-    return raw
+    return [x.strip().upper() for x in text.replace("\n", " ").replace(",", " ").split(" ") if x.strip()]
 
 
 def preseason_points(delta: int) -> int:
@@ -77,21 +89,12 @@ def preseason_locked() -> bool:
     return now_utc() >= PRESEASON_LOCK_UTC
 
 
-async def jolpica_get_json(path: str) -> dict:
-    url = f"{JOLPICA_BASE.rstrip('/')}/{path.lstrip('/')}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=30) as resp:
-            resp.raise_for_status()
-            return await resp.json()
-
-
 # =======================
 # DB
 # =======================
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript(
-            """
+        await db.executescript("""
         PRAGMA journal_mode=WAL;
 
         CREATE TABLE IF NOT EXISTS players (
@@ -167,12 +170,19 @@ async def init_db():
             computed_utc TEXT NOT NULL,
             PRIMARY KEY (season, category, user_id)
         );
-        """
-        )
+
+        CREATE TABLE IF NOT EXISTS reminders_sent (
+            season INTEGER NOT NULL,
+            round INTEGER NOT NULL,
+            session TEXT NOT NULL,
+            reminder_key TEXT NOT NULL,
+            PRIMARY KEY (season, round, session, reminder_key)
+        );
+        """)
         await db.commit()
 
 
-async def upsert_player(user: discord.User):
+async def upsert_player(user: discord.abc.User):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO players(user_id, display_name) VALUES(?, ?) "
@@ -182,11 +192,12 @@ async def upsert_player(user: discord.User):
         await db.commit()
 
 
-async def set_registered(user_id: int):
+async def set_registered(user_id: int, display_name: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE players SET registered=1, registered_utc=? WHERE user_id=?",
-            (iso(now_utc()), user_id),
+            "INSERT INTO players(user_id, display_name, registered, registered_utc) VALUES(?, ?, 1, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, registered=1, registered_utc=excluded.registered_utc",
+            (user_id, display_name, iso(now_utc())),
         )
         await db.commit()
 
@@ -199,26 +210,20 @@ async def is_registered(user_id: int) -> bool:
 
 
 async def is_admin(interaction: discord.Interaction) -> bool:
-    # Must be used in a server
     if not interaction.guild:
         return False
 
-    # Prefer the interaction user object (usually a discord.Member with roles)
     member = interaction.user if isinstance(interaction.user, discord.Member) else None
-
-    # If not a Member (rare), fetch from API (works even without member cache)
     if member is None:
         try:
             member = await interaction.guild.fetch_member(interaction.user.id)
         except Exception:
             return False
 
-    # If you want: allow server admins too (optional)
-    if getattr(member, "guild_permissions", None) and member.guild_permissions.administrator:
+    if member.guild_permissions.administrator or member.guild_permissions.manage_guild:
         return True
 
-    # Role-name based check
-    return any(getattr(r, "name", "") == ADMIN_ROLE for r in getattr(member, "roles", []))
+    return any(getattr(role, "name", "") == ADMIN_ROLE for role in getattr(member, "roles", []))
 
 
 async def event_locked(season: int, round_: int, session: str) -> bool:
@@ -236,29 +241,54 @@ async def event_locked(season: int, round_: int, session: str) -> bool:
         return now_utc() >= from_iso(start_utc)
 
 
+async def reminder_sent(season: int, round_: int, session: str, reminder_key: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM reminders_sent WHERE season=? AND round=? AND session=? AND reminder_key=?",
+            (season, round_, session, reminder_key),
+        )
+        return await cur.fetchone() is not None
+
+
+async def mark_reminder_sent(season: int, round_: int, session: str, reminder_key: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO reminders_sent(season, round, session, reminder_key) VALUES(?, ?, ?, ?)",
+            (season, round_, session, reminder_key),
+        )
+        await db.commit()
+
+
 # =======================
-# SCHEDULE + RESULTS
+# API
 # =======================
+async def jolpica_get_json(path: str) -> dict:
+    url = f"{JOLPICA_BASE.rstrip('/')}/{path.lstrip('/')}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=30) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+
 async def sync_schedule(season: int):
     data = await jolpica_get_json(f"{season}.json")
     races = data["MRData"]["RaceTable"]["Races"]
+
     async with aiosqlite.connect(DB_PATH) as db:
         for r in races:
             rnd = int(r["round"])
 
             if "Qualifying" in r:
                 q = r["Qualifying"]
-                qdt = datetime.fromisoformat(f"{q['date']}T{q['time'].replace('Z','+00:00')}")
+                qdt = datetime.fromisoformat(f"{q['date']}T{q['time'].replace('Z', '+00:00')}")
                 await db.execute(
-                    "INSERT OR REPLACE INTO events(season, round, session, start_utc, locked, scored) "
-                    "VALUES(?, ?, 'quali', ?, 0, 0)",
+                    "INSERT OR REPLACE INTO events(season, round, session, start_utc, locked, scored) VALUES(?, ?, 'quali', ?, 0, 0)",
                     (season, rnd, iso(qdt)),
                 )
 
-            rdt = datetime.fromisoformat(f"{r['date']}T{r['time'].replace('Z','+00:00')}")
+            rdt = datetime.fromisoformat(f"{r['date']}T{r['time'].replace('Z', '+00:00')}")
             await db.execute(
-                "INSERT OR REPLACE INTO events(season, round, session, start_utc, locked, scored) "
-                "VALUES(?, ?, 'race', ?, 0, 0)",
+                "INSERT OR REPLACE INTO events(season, round, session, start_utc, locked, scored) VALUES(?, ?, 'race', ?, 0, 0)",
                 (season, rnd, iso(rdt)),
             )
 
@@ -334,6 +364,7 @@ async def compute_session_scores(season: int, round_: int, session: str) -> bool
             (season, round_, session),
         )
         await db.commit()
+
     return True
 
 
@@ -377,7 +408,54 @@ async def compute_preseason_scores(season: int, category: str) -> bool:
             )
 
         await db.commit()
+
     return True
+
+
+# =======================
+# REMINDERS / POSTS
+# =======================
+async def send_role_reminder(bot: discord.Client, message: str):
+    if not REMINDER_CHANNEL_ID:
+        return
+
+    channel = bot.get_channel(REMINDER_CHANNEL_ID)
+    if not channel:
+        return
+
+    role = discord.utils.get(channel.guild.roles, name=REMINDER_ROLE)
+    content = f"{role.mention}\n\n{message}" if role else message
+
+    await channel.send(
+        content,
+        allowed_mentions=discord.AllowedMentions(roles=True),
+    )
+
+
+async def post_leaderboard(bot: discord.Client, season: int, round_: int, session: str):
+    if not LEADERBOARD_CHANNEL_ID:
+        return
+
+    channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
+    if not channel:
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT p.display_name, s.points
+            FROM scores s
+            JOIN players p ON p.user_id=s.user_id
+            WHERE s.season=? AND s.round=? AND s.session=?
+            ORDER BY s.points DESC, p.display_name ASC
+        """, (season, round_, session))
+        rows = await cur.fetchall()
+
+    if not rows:
+        await channel.send(f"✅ {season} R{round_} **{session.upper()}** scored, but no picks were found.")
+        return
+
+    msg = "\n".join([f"**{i}. {name}** — {pts} pts" for i, (name, pts) in enumerate(rows, 1)])
+    await channel.send(f"🏁 **{season} Round {round_} — {session.upper()} Leaderboard**\n{msg}")
 
 
 # =======================
@@ -390,7 +468,14 @@ class Client(discord.Client):
 
     async def setup_hook(self):
         await init_db()
-        await self.tree.sync()
+
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+        else:
+            await self.tree.sync()
+
         asyncio.create_task(background_loop(self))
 
 
@@ -400,59 +485,78 @@ client = Client()
 # =======================
 # BACKGROUND LOOP
 # =======================
-async def post_leaderboard(bot: discord.Client, season: int, round_: int, session: str):
-    if not LEADERBOARD_CHANNEL_ID:
-        return
-    channel = bot.get_channel(int(LEADERBOARD_CHANNEL_ID))
-    if not channel:
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            SELECT p.display_name, s.points
-            FROM scores s
-            JOIN players p ON p.user_id=s.user_id
-            WHERE s.season=? AND s.round=? AND s.session=?
-            ORDER BY s.points DESC, p.display_name ASC
-            """,
-            (season, round_, session),
-        )
-        rows = await cur.fetchall()
-
-    if not rows:
-        await channel.send(f"✅ {season} R{round_} **{session.upper()}** scored, but no picks found.")
-        return
-
-    lines = [f"**{i}. {name}** — {pts} pts" for i, (name, pts) in enumerate(rows, 1)]
-    await channel.send(f"🏁 **{season} Round {round_} — {session.upper()} Leaderboard**\n" + "\n".join(lines))
-
-
 async def background_loop(bot: discord.Client):
     await bot.wait_until_ready()
+
     while not bot.is_closed():
         try:
-            # Auto-lock sessions past start
+            # Preseason 24h reminder
+            preseason_reminder_time = PRESEASON_LOCK_UTC - PRESEASON_REMINDER_BEFORE
+            if preseason_reminder_time <= now_utc() < PRESEASON_LOCK_UTC:
+                if not await reminder_sent(LEAGUE_SEASON, 0, "preseason", "24h"):
+                    await send_role_reminder(
+                        bot,
+                        "⏰ **Preseason Reminder**\n"
+                        "There are **24 hours left** before preseason predictions lock.\n"
+                        f"Use `/register_preseason season:{LEAGUE_SEASON} drivers:<22 drivers> constructors:<11 teams>`"
+                    )
+                    await mark_reminder_sent(LEAGUE_SEASON, 0, "preseason", "24h")
+
+            # Load all events
             async with aiosqlite.connect(DB_PATH) as db:
-                cur = await db.execute("SELECT season, round, session, start_utc, locked FROM events")
-                for season, rnd, sess, start_utc, locked in await cur.fetchall():
-                    if locked:
-                        continue
-                    if now_utc() >= from_iso(start_utc):
+                cur = await db.execute("SELECT season, round, session, start_utc, locked, scored FROM events")
+                events = await cur.fetchall()
+
+            # Auto-lock started events
+            async with aiosqlite.connect(DB_PATH) as db:
+                for season, rnd, sess, start_utc, locked, scored in events:
+                    start_dt = from_iso(start_utc)
+                    if not locked and now_utc() >= start_dt:
                         await db.execute(
                             "UPDATE events SET locked=1 WHERE season=? AND round=? AND session=?",
                             (season, rnd, sess),
                         )
                 await db.commit()
 
-            # Auto-fetch results for unscored sessions after delay
+            # Session reminders
+            for season, rnd, sess, start_utc, locked, scored in events:
+                start_dt = from_iso(start_utc)
+
+                if sess == "quali":
+                    reminder_time = start_dt - QUALI_REMINDER_BEFORE
+                    if reminder_time <= now_utc() < start_dt:
+                        if not await reminder_sent(season, rnd, sess, "24h"):
+                            await send_role_reminder(
+                                bot,
+                                f"⏰ **Qualifying Reminder**\n"
+                                f"Round **{rnd} Qualifying** starts in **24 hours**.\n"
+                                f"Lock in your prediction with:\n"
+                                f"`/predict season:{season} round:{rnd} session:quali grid:<22 drivers>`"
+                            )
+                            await mark_reminder_sent(season, rnd, sess, "24h")
+
+                elif sess == "race":
+                    reminder_time = start_dt - RACE_REMINDER_BEFORE
+                    if reminder_time <= now_utc() < start_dt:
+                        if not await reminder_sent(season, rnd, sess, "12h"):
+                            await send_role_reminder(
+                                bot,
+                                f"⏰ **Race Reminder**\n"
+                                f"Round **{rnd} Race** starts in **12 hours**.\n"
+                                f"Lock in your prediction with:\n"
+                                f"`/predict season:{season} round:{rnd} session:race grid:<22 drivers>`"
+                            )
+                            await mark_reminder_sent(season, rnd, sess, "12h")
+
+            # Auto-fetch and score
             async with aiosqlite.connect(DB_PATH) as db:
                 cur = await db.execute("SELECT season, round, session, start_utc, scored FROM events WHERE scored=0")
-                events = await cur.fetchall()
+                unscored_events = await cur.fetchall()
 
-            for season, rnd, sess, start_utc, scored in events:
+            for season, rnd, sess, start_utc, scored in unscored_events:
                 start_dt = from_iso(start_utc)
                 delay = SESSION_RESULT_DELAY.get(sess, timedelta(hours=3))
+
                 if now_utc() < start_dt + delay:
                     continue
 
@@ -468,7 +572,7 @@ async def background_loop(bot: discord.Client):
                             (season, rnd, sess, i, drv.upper()),
                         )
                     await db.execute(
-                        "UPDATE events SET locked=1 WHERE season=? AND round=? AND session=?",
+                        "UPDATE events SET locked=1, scored=1 WHERE season=? AND round=? AND session=?",
                         (season, rnd, sess),
                     )
                     await db.commit()
@@ -477,37 +581,28 @@ async def background_loop(bot: discord.Client):
                 if ok:
                     await post_leaderboard(bot, season, rnd, sess)
 
-        except Exception:
-            pass
+        except Exception as e:
+            print("BACKGROUND LOOP ERROR:", e)
 
         await asyncio.sleep(60)
 
 
 # =======================
-# COMMANDS
+# EVENTS
 # =======================
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (id={client.user.id})")
 
 
-@client.tree.command(name="sync_schedule", description="(Admin) Sync qualifying + race calendar for a season")
-async def sync_schedule_cmd(interaction: discord.Interaction, season: int):
-    if not await is_admin(interaction):
-        return await interaction.response.send_message("Admin only.")
-    await interaction.response.defer(thinking=True)
-    await sync_schedule(season)
-    await interaction.followup.send(f"✅ Synced quali + race schedule for {season}.")
-
-
-@client.tree.command(
-    name="register_preseason",
-    description="Join the league by submitting preseason predictions (required, closes at lock time)",
-)
+# =======================
+# COMMANDS - USER
+# =======================
+@client.tree.command(name="register_preseason", description="Join the league by submitting preseason predictions")
 @app_commands.describe(
     season="e.g. 2026",
-    drivers="22 driver codes in order (P1..P22), comma/space separated",
-    constructors="11 constructor codes in order (P1..P11), comma/space separated",
+    drivers="22 driver codes in order (P1..P22)",
+    constructors="11 constructor codes in order (P1..P11)"
 )
 async def register_preseason(interaction: discord.Interaction, season: int, drivers: str, constructors: str):
     await upsert_player(interaction.user)
@@ -519,50 +614,46 @@ async def register_preseason(interaction: discord.Interaction, season: int, driv
 
     d = parse_list(drivers)
     c = parse_list(constructors)
+
     if len(d) != 22:
         return await interaction.response.send_message("Drivers preseason must have exactly **22** entries.")
     if len(c) != 11:
         return await interaction.response.send_message("Constructors preseason must have exactly **11** entries.")
 
     created = iso(now_utc())
+
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM preseason_picks WHERE season=? AND category=? AND user_id=?",
-            (season, "drivers", interaction.user.id),
-        )
-        await db.execute(
-            "DELETE FROM preseason_picks WHERE season=? AND category=? AND user_id=?",
-            (season, "constructors", interaction.user.id),
-        )
+        await db.execute("DELETE FROM preseason_picks WHERE season=? AND category='drivers' AND user_id=?", (season, interaction.user.id))
+        await db.execute("DELETE FROM preseason_picks WHERE season=? AND category='constructors' AND user_id=?", (season, interaction.user.id))
 
         for i, item in enumerate(d, 1):
             await db.execute(
-                "INSERT INTO preseason_picks(season, category, user_id, pos, item, created_utc) "
-                "VALUES(?, 'drivers', ?, ?, ?, ?)",
+                "INSERT INTO preseason_picks(season, category, user_id, pos, item, created_utc) VALUES(?, 'drivers', ?, ?, ?, ?)",
                 (season, interaction.user.id, i, item.upper(), created),
             )
+
         for i, item in enumerate(c, 1):
             await db.execute(
-                "INSERT INTO preseason_picks(season, category, user_id, pos, item, created_utc) "
-                "VALUES(?, 'constructors', ?, ?, ?, ?)",
+                "INSERT INTO preseason_picks(season, category, user_id, pos, item, created_utc) VALUES(?, 'constructors', ?, ?, ?, ?)",
                 (season, interaction.user.id, i, item.upper(), created),
             )
 
         await db.commit()
 
-    await set_registered(interaction.user.id)
+    await set_registered(interaction.user.id, interaction.user.display_name)
     await interaction.response.send_message("✅ Registered! Your preseason predictions are saved.")
 
 
-@client.tree.command(name="predict", description="Submit qualifying or race grid prediction (P1..P22)")
+@client.tree.command(name="predict", description="Submit qualifying or race prediction (P1..P22)")
 @app_commands.describe(
     season="e.g. 2026",
     round="e.g. 1",
     session="quali or race",
-    grid="22 driver codes in order (P1..P22)",
+    grid="22 driver codes in order (P1..P22)"
 )
 async def predict(interaction: discord.Interaction, season: int, round: int, session: str, grid: str):
     session = session.lower().strip()
+
     if session not in SESSIONS:
         return await interaction.response.send_message("Session must be `quali` or `race`.")
 
@@ -591,12 +682,13 @@ async def predict(interaction: discord.Interaction, season: int, round: int, ses
             "DELETE FROM picks WHERE season=? AND round=? AND session=? AND user_id=?",
             (season, round, session, interaction.user.id),
         )
+
         for i, drv in enumerate(entries, 1):
             await db.execute(
-                "INSERT INTO picks(season, round, session, user_id, pos, driver, created_utc) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO picks(season, round, session, user_id, pos, driver, created_utc) VALUES(?, ?, ?, ?, ?, ?, ?)",
                 (season, round, session, interaction.user.id, i, drv.upper(), created),
             )
+
         await db.commit()
 
     await interaction.response.send_message(f"✅ Saved your **{session.upper()}** prediction for {season} Round {round}.")
@@ -605,56 +697,104 @@ async def predict(interaction: discord.Interaction, season: int, round: int, ses
 @client.tree.command(name="standings", description="Overall standings (quali + race totals)")
 async def standings(interaction: discord.Interaction, season: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            SELECT p.display_name, COALESCE(SUM(s.points),0) AS pts
+        cur = await db.execute("""
+            SELECT p.display_name, COALESCE(SUM(s.points), 0) AS pts
             FROM players p
             LEFT JOIN scores s ON s.user_id=p.user_id AND s.season=?
             WHERE p.registered=1
             GROUP BY p.user_id
             ORDER BY pts DESC, p.display_name ASC
-            """,
-            (season,),
-        )
+        """, (season,))
         rows = await cur.fetchall()
 
     if not rows:
         return await interaction.response.send_message("No standings yet.")
+
     msg = "\n".join([f"**{i}. {name}** — {pts} pts" for i, (name, pts) in enumerate(rows, 1)])
     await interaction.response.send_message(msg)
 
 
-@client.tree.command(name="session_board", description="Leaderboard for a specific qualifying/race session")
+@client.tree.command(name="session_board", description="Leaderboard for a specific qualifying or race session")
 async def session_board(interaction: discord.Interaction, season: int, round: int, session: str):
     session = session.lower().strip()
+
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
+        cur = await db.execute("""
             SELECT p.display_name, s.points
             FROM scores s
             JOIN players p ON p.user_id=s.user_id
             WHERE s.season=? AND s.round=? AND s.session=?
             ORDER BY s.points DESC, p.display_name ASC
-            """,
-            (season, round, session),
-        )
+        """, (season, round, session))
         rows = await cur.fetchall()
 
     if not rows:
         return await interaction.response.send_message("No scored results for that session yet.")
+
     msg = "\n".join([f"**{i}. {name}** — {pts} pts" for i, (name, pts) in enumerate(rows, 1)])
     await interaction.response.send_message(msg)
 
 
-@client.tree.command(name="admin_fetch_and_score", description="(Admin) Fetch results now and score (quali/race)")
+@client.tree.command(name="preseason_board", description="Preseason leaderboard")
+async def preseason_board(interaction: discord.Interaction, season: int, category: str):
+    category = category.lower().strip()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT p.display_name, s.points
+            FROM preseason_scores s
+            JOIN players p ON p.user_id=s.user_id
+            WHERE s.season=? AND s.category=? AND p.registered=1
+            ORDER BY s.points DESC, p.display_name ASC
+        """, (season, category))
+        rows = await cur.fetchall()
+
+    if not rows:
+        return await interaction.response.send_message("No preseason scores yet.")
+
+    msg = "\n".join([f"**{i}. {name}** — {pts} pts" for i, (name, pts) in enumerate(rows, 1)])
+    await interaction.response.send_message(msg)
+
+
+@client.tree.command(name="registered_players", description="Show all registered fantasy league players")
+async def registered_players(interaction: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT display_name FROM players WHERE registered=1 ORDER BY display_name"
+        )
+        rows = await cur.fetchall()
+
+    if not rows:
+        return await interaction.response.send_message("No players have registered yet.")
+
+    msg = "\n".join([f"{i}. {name}" for i, (name,) in enumerate(rows, 1)])
+    await interaction.response.send_message(f"🏁 **Registered Players**\n{msg}")
+
+
+# =======================
+# COMMANDS - ADMIN
+# =======================
+@client.tree.command(name="sync_schedule", description="Admin: sync qualifying + race schedule for a season")
+async def sync_schedule_cmd(interaction: discord.Interaction, season: int):
+    if not await is_admin(interaction):
+        return await interaction.response.send_message("Admin only.")
+
+    await interaction.response.defer(thinking=True)
+    await sync_schedule(season)
+    await interaction.followup.send(f"✅ Synced quali + race schedule for {season}.")
+
+
+@client.tree.command(name="admin_fetch_and_score", description="Admin: fetch results now and score")
 async def admin_fetch_and_score(interaction: discord.Interaction, season: int, round: int, session: str):
     if not await is_admin(interaction):
         return await interaction.response.send_message("Admin only.")
+
     session = session.lower().strip()
     if session not in SESSIONS:
         return await interaction.response.send_message("Session must be `quali` or `race`.")
 
     await interaction.response.defer(thinking=True)
+
     order = await fetch_results_order(season, round, session)
     if len(order) < 22:
         return await interaction.followup.send("No results available yet.")
@@ -667,7 +807,7 @@ async def admin_fetch_and_score(interaction: discord.Interaction, season: int, r
                 (season, round, session, i, drv.upper()),
             )
         await db.execute(
-            "UPDATE events SET locked=1 WHERE season=? AND round=? AND session=?",
+            "UPDATE events SET locked=1, scored=1 WHERE season=? AND round=? AND session=?",
             (season, round, session),
         )
         await db.commit()
@@ -676,17 +816,14 @@ async def admin_fetch_and_score(interaction: discord.Interaction, season: int, r
     if ok:
         await interaction.followup.send(f"✅ Scored {season} Round {round} {session}.")
     else:
-        await interaction.followup.send("Results stored, but scoring failed (missing picks or results).")
+        await interaction.followup.send("Results stored, but scoring failed.")
 
 
-@client.tree.command(
-    name="admin_set_preseason_results",
-    description="(Admin) Set final championship standings and score preseason (end of season)",
-)
+@client.tree.command(name="admin_set_preseason_results", description="Admin: set final preseason results and score")
 @app_commands.describe(
     season="e.g. 2026",
     category="drivers or constructors",
-    grid="Final standings in order (22 drivers or 11 constructors)",
+    grid="Final standings in order"
 )
 async def admin_set_preseason_results(interaction: discord.Interaction, season: int, category: str, grid: str):
     if not await is_admin(interaction):
@@ -702,6 +839,7 @@ async def admin_set_preseason_results(interaction: discord.Interaction, season: 
         return await interaction.response.send_message(f"You must provide exactly **{expected}** entries.")
 
     await interaction.response.defer(thinking=True)
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM preseason_results WHERE season=? AND category=?", (season, category))
         for i, item in enumerate(entries, 1):
@@ -718,30 +856,214 @@ async def admin_set_preseason_results(interaction: discord.Interaction, season: 
         await interaction.followup.send("No preseason results found to score.")
 
 
-@client.tree.command(name="preseason_board", description="Preseason leaderboard (drivers or constructors)")
-async def preseason_board(interaction: discord.Interaction, season: int, category: str):
-    category = category.lower().strip()
+@client.tree.command(name="admin_register_player", description="Admin: manually mark a user as registered")
+async def admin_register_player(interaction: discord.Interaction, user: discord.Member):
+    if not await is_admin(interaction):
+        return await interaction.response.send_message("Admin only.")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO players(user_id, display_name, registered, registered_utc) VALUES(?, ?, 1, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, registered=1, registered_utc=excluded.registered_utc",
+            (user.id, user.display_name, iso(now_utc())),
+        )
+        await db.commit()
+
+    await interaction.response.send_message(f"✅ {user.display_name} is now registered.")
+
+
+@client.tree.command(name="admin_unregister_player", description="Admin: remove a player from the league")
+async def admin_unregister_player(interaction: discord.Interaction, user: discord.Member):
+    if not await is_admin(interaction):
+        return await interaction.response.send_message("Admin only.")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE players SET registered=0 WHERE user_id=?", (user.id,))
+        await db.execute("DELETE FROM preseason_picks WHERE user_id=?", (user.id,))
+        await db.execute("DELETE FROM preseason_scores WHERE user_id=?", (user.id,))
+        await db.execute("DELETE FROM picks WHERE user_id=?", (user.id,))
+        await db.execute("DELETE FROM scores WHERE user_id=?", (user.id,))
+        await db.commit()
+
+    await interaction.response.send_message(f"🗑️ Removed {user.display_name} from the league.")
+
+
+@client.tree.command(
+    name="admin_set_preseason_for_player",
+    description="Admin: enter or overwrite a player's preseason predictions even after the lock"
+)
+@app_commands.describe(
+    user="The player",
+    season="e.g. 2026",
+    drivers="22 driver codes in order (P1..P22)",
+    constructors="11 constructor codes in order (P1..P11)"
+)
+async def admin_set_preseason_for_player(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    season: int,
+    drivers: str,
+    constructors: str
+):
+    if not await is_admin(interaction):
+        return await interaction.response.send_message("Admin only.")
+
+    d = parse_list(drivers)
+    c = parse_list(constructors)
+
+    if len(d) != 22:
+        return await interaction.response.send_message("Drivers preseason must have exactly **22** entries.")
+    if len(c) != 11:
+        return await interaction.response.send_message("Constructors preseason must have exactly **11** entries.")
+
+    created = iso(now_utc())
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO players(user_id, display_name, registered, registered_utc) VALUES(?, ?, 1, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, registered=1, registered_utc=excluded.registered_utc",
+            (user.id, user.display_name, created),
+        )
+
+        await db.execute(
+            "DELETE FROM preseason_picks WHERE season=? AND category='drivers' AND user_id=?",
+            (season, user.id),
+        )
+        await db.execute(
+            "DELETE FROM preseason_picks WHERE season=? AND category='constructors' AND user_id=?",
+            (season, user.id),
+        )
+        await db.execute(
+            "DELETE FROM preseason_scores WHERE season=? AND user_id=?",
+            (season, user.id),
+        )
+
+        for i, item in enumerate(d, 1):
+            await db.execute(
+                "INSERT INTO preseason_picks(season, category, user_id, pos, item, created_utc) VALUES(?, 'drivers', ?, ?, ?, ?)",
+                (season, user.id, i, item.upper(), created),
+            )
+
+        for i, item in enumerate(c, 1):
+            await db.execute(
+                "INSERT INTO preseason_picks(season, category, user_id, pos, item, created_utc) VALUES(?, 'constructors', ?, ?, ?, ?)",
+                (season, user.id, i, item.upper(), created),
+            )
+
+        await db.commit()
+
+    await interaction.response.send_message(f"✅ Saved preseason predictions for {user.display_name}.")
+
+
+@client.tree.command(
+    name="admin_set_prediction_for_player",
+    description="Admin: enter or overwrite a player's qualifying or race prediction even after lock"
+)
+@app_commands.describe(
+    user="The player",
+    season="e.g. 2026",
+    round="e.g. 1",
+    session="quali or race",
+    grid="22 driver codes in order (P1..P22)"
+)
+async def admin_set_prediction_for_player(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    season: int,
+    round: int,
+    session: str,
+    grid: str
+):
+    if not await is_admin(interaction):
+        return await interaction.response.send_message("Admin only.")
+
+    session = session.lower().strip()
+    if session not in ("quali", "race"):
+        return await interaction.response.send_message("Session must be `quali` or `race`.")
+
+    entries = parse_list(grid)
+    if len(entries) != 22:
+        return await interaction.response.send_message("You must provide exactly **22** entries.")
+
+    created = iso(now_utc())
+
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            """
-            SELECT p.display_name, s.points
-            FROM preseason_scores s
-            JOIN players p ON p.user_id=s.user_id
-            WHERE s.season=? AND s.category=? AND p.registered=1
-            ORDER BY s.points DESC, p.display_name ASC
-            """,
-            (season, category),
+            "SELECT 1 FROM events WHERE season=? AND round=? AND session=?",
+            (season, round, session),
         )
-        rows = await cur.fetchall()
+        if not await cur.fetchone():
+            return await interaction.response.send_message("Event not found. Run `/sync_schedule` first.")
 
-    if not rows:
-        return await interaction.response.send_message("No preseason scores yet.")
-    msg = "\n".join([f"**{i}. {name}** — {pts} pts" for i, (name, pts) in enumerate(rows, 1)])
-    await interaction.response.send_message(msg)
+        await db.execute(
+            "INSERT INTO players(user_id, display_name, registered, registered_utc) VALUES(?, ?, 1, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, registered=1, registered_utc=excluded.registered_utc",
+            (user.id, user.display_name, created),
+        )
+
+        await db.execute(
+            "DELETE FROM picks WHERE season=? AND round=? AND session=? AND user_id=?",
+            (season, round, session, user.id),
+        )
+        await db.execute(
+            "DELETE FROM scores WHERE season=? AND round=? AND session=? AND user_id=?",
+            (season, round, session, user.id),
+        )
+
+        for i, drv in enumerate(entries, 1):
+            await db.execute(
+                "INSERT INTO picks(season, round, session, user_id, pos, driver, created_utc) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (season, round, session, user.id, i, drv.upper(), created),
+            )
+
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"✅ Saved {session.upper()} prediction for {user.display_name} in {season} Round {round}."
+    )
+
+
+@client.tree.command(name="admin_delete_prediction", description="Admin: delete a user's quali or race prediction")
+async def admin_delete_prediction(interaction: discord.Interaction, user: discord.Member, season: int, round: int, session: str):
+    if not await is_admin(interaction):
+        return await interaction.response.send_message("Admin only.")
+
+    session = session.lower().strip()
+    if session not in ("quali", "race"):
+        return await interaction.response.send_message("Session must be `quali` or `race`.")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM picks WHERE user_id=? AND season=? AND round=? AND session=?",
+            (user.id, season, round, session),
+        )
+        await db.execute(
+            "DELETE FROM scores WHERE user_id=? AND season=? AND round=? AND session=?",
+            (user.id, season, round, session),
+        )
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"🗑️ Deleted {user.display_name}'s {session.upper()} prediction for {season} Round {round}."
+    )
+
+
+@client.tree.command(name="admin_delete_preseason", description="Admin: delete a user's preseason predictions")
+async def admin_delete_preseason(interaction: discord.Interaction, user: discord.Member, season: int):
+    if not await is_admin(interaction):
+        return await interaction.response.send_message("Admin only.")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM preseason_picks WHERE user_id=? AND season=?", (user.id, season))
+        await db.execute("DELETE FROM preseason_scores WHERE user_id=? AND season=?", (user.id, season))
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"🗑️ Deleted {user.display_name}'s preseason predictions for {season}."
+    )
 
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
-
 
 client.run(DISCORD_TOKEN)
