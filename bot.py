@@ -1015,6 +1015,38 @@ async def admin_delete_prediction(interaction: discord.Interaction, user: discor
         f"🗑️ Deleted {user.display_name}'s prediction."
     )
 
+@client.tree.command(name="admin_register_role_members", description="Admin: register everyone who has the fantasy player role")
+async def admin_register_role_members(interaction: discord.Interaction):
+    if not await is_admin(interaction):
+        return await interaction.response.send_message("Admin only.")
+
+    if not interaction.guild:
+        return await interaction.response.send_message("This command must be used in a server.")
+
+    role = discord.utils.get(interaction.guild.roles, name=REMINDER_ROLE)
+
+    if not role:
+        return await interaction.response.send_message(f"Role `{REMINDER_ROLE}` not found.")
+
+    await interaction.response.defer(thinking=True)
+
+    registered_count = 0
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        for member in role.members:
+            if member.bot:
+                continue
+
+            await db.execute(
+                "INSERT INTO players(user_id, display_name, registered, registered_utc) VALUES(?, ?, 1, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, registered=1, registered_utc=excluded.registered_utc",
+                (member.id, member.display_name, iso(now_utc())),
+            )
+            registered_count += 1
+
+        await db.commit()
+
+    await interaction.followup.send(f"✅ Registered {registered_count} players from the `{REMINDER_ROLE}` role.")
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
