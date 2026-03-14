@@ -9,6 +9,32 @@ import aiosqlite
 import discord
 from discord import app_commands
 
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+import json
+import tempfile
+
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+
+def get_drive():
+    creds = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+
+    with tempfile.NamedTemporaryFile(delete=False, mode="w") as f:
+        json.dump(creds, f)
+        key_path = f.name
+
+    gauth = GoogleAuth()
+    gauth.settings["client_config_backend"] = "service"
+    gauth.settings["service_config"] = {
+        "client_json_file_path": key_path,
+        "client_user_email": creds["client_email"],
+        "client_json_dict": creds,
+    }
+
+    gauth.ServiceAuth()
+    return GoogleDrive(gauth)
 # =======================
 # CONFIG
 # =======================
@@ -488,6 +514,26 @@ async def post_leaderboard(bot: discord.Client, season: int, round_: int, sessio
     msg = "\n".join([f"**{i}. {name}** — {pts} pts" for i, (name, pts) in enumerate(rows, 1)])
     await channel.send(f"🏁 **{season} Round {round_} — {session.upper()} Leaderboard**\n{msg}")
 
+async def backup_database_to_drive():
+
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        return
+
+    try:
+        drive = get_drive()
+
+        file = drive.CreateFile({
+            "title": f"f1fantasy_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db",
+            "parents": [{"id": GOOGLE_DRIVE_FOLDER_ID}]
+        })
+
+        file.SetContentFile(DB_PATH)
+        file.Upload()
+
+        print("Database backup uploaded to Google Drive")
+
+    except Exception as e:
+        print("Backup failed:", e)
 
 # =======================
 # DISCORD CLIENT
@@ -616,7 +662,10 @@ async def background_loop(bot: discord.Client):
             print("BACKGROUND LOOP ERROR:", e)
 
         await asyncio.sleep(60)
-
+last_backup = None
+if not last_backup or now_utc() - last_backup > timedelta(hours=6):
+    await backup_database_to_drive()
+    last_backup = now_utc()
 
 # =======================
 # EVENTS
