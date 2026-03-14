@@ -1,3 +1,5 @@
 discord.py
 aiosqlite
 aiohttp
+pydrive2
+google-auth
