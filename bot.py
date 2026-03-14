@@ -1077,28 +1077,6 @@ async def admin_delete_prediction(interaction: discord.Interaction, user: discor
     await interaction.response.send_message(
         f"🗑️ Deleted {user.display_name}'s {session.upper()} prediction for {season} Round {round}."
     )
-
-
-@client.tree.command(name="admin_delete_preseason", description="Admin: delete a user's preseason predictions")
-async def admin_delete_preseason(interaction: discord.Interaction, user: discord.Member, season: int):
-    if not await is_admin(interaction):
-        return await interaction.response.send_message("Admin only.")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM preseason_picks WHERE user_id=? AND season=?", (user.id, season))
-        await db.execute("DELETE FROM preseason_scores WHERE user_id=? AND season=?", (user.id, season))
-        await db.commit()
-
-    await interaction.response.send_message(
-        f"🗑️ Deleted {user.display_name}'s preseason predictions for {season}."
-    )
-
-
-if not DISCORD_TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN env var.")
-
-client.run(DISCORD_TOKEN)
-
 @client.tree.command(name="admin_repair_registrations", description="Admin: mark all existing league participants as registered")
 async def admin_repair_registrations(interaction: discord.Interaction):
     if not await is_admin(interaction):
@@ -1140,3 +1118,25 @@ async def admin_repair_registrations(interaction: discord.Interaction):
         await db.commit()
 
     await interaction.followup.send(f"✅ Repaired registration for {repaired} players.")
+
+@client.tree.command(name="admin_delete_preseason", description="Admin: delete a user's preseason predictions")
+async def admin_delete_preseason(interaction: discord.Interaction, user: discord.Member, season: int):
+    if not await is_admin(interaction):
+        return await interaction.response.send_message("Admin only.")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM preseason_picks WHERE user_id=? AND season=?", (user.id, season))
+        await db.execute("DELETE FROM preseason_scores WHERE user_id=? AND season=?", (user.id, season))
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"🗑️ Deleted {user.display_name}'s preseason predictions for {season}."
+    )
+
+
+if not DISCORD_TOKEN:
+    raise RuntimeError("Missing DISCORD_TOKEN env var.")
+
+client.run(DISCORD_TOKEN)
+
+
