@@ -204,9 +204,40 @@ async def set_registered(user_id: int, display_name: str):
 
 async def is_registered(user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT registered FROM players WHERE user_id=?", (user_id,))
+        # Normal registration check
+        cur = await db.execute(
+            "SELECT registered FROM players WHERE user_id=?",
+            (user_id,)
+        )
         row = await cur.fetchone()
-        return bool(row and row[0] == 1)
+        if row and row[0] == 1:
+            return True
+
+        # Fallback 1: preseason picks exist
+        cur = await db.execute(
+            "SELECT 1 FROM preseason_picks WHERE user_id=? LIMIT 1",
+            (user_id,)
+        )
+        if await cur.fetchone():
+            return True
+
+        # Fallback 2: normal session picks exist
+        cur = await db.execute(
+            "SELECT 1 FROM picks WHERE user_id=? LIMIT 1",
+            (user_id,)
+        )
+        if await cur.fetchone():
+            return True
+
+        # Fallback 3: scores exist
+        cur = await db.execute(
+            "SELECT 1 FROM scores WHERE user_id=? LIMIT 1",
+            (user_id,)
+        )
+        if await cur.fetchone():
+            return True
+
+        return False
 
 
 async def is_admin(interaction: discord.Interaction) -> bool:
@@ -1067,3 +1098,45 @@ if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
 
 client.run(DISCORD_TOKEN)
+
+@client.tree.command(name="admin_repair_registrations", description="Admin: mark all existing league participants as registered")
+async def admin_repair_registrations(interaction: discord.Interaction):
+    if not await is_admin(interaction):
+        return await interaction.response.send_message("Admin only.")
+
+    await interaction.response.defer(thinking=True)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT DISTINCT user_id FROM (
+                SELECT user_id FROM preseason_picks
+                UNION
+                SELECT user_id FROM picks
+                UNION
+                SELECT user_id FROM scores
+                UNION
+                SELECT user_id FROM preseason_scores
+            )
+        """)
+        users = [row[0] for row in await cur.fetchall()]
+
+        repaired = 0
+
+        for user_id in users:
+            cur = await db.execute(
+                "SELECT display_name FROM players WHERE user_id=?",
+                (user_id,)
+            )
+            row = await cur.fetchone()
+            display_name = row[0] if row and row[0] else f"User {user_id}"
+
+            await db.execute(
+                "INSERT INTO players(user_id, display_name, registered, registered_utc) VALUES(?, ?, 1, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET registered=1, registered_utc=excluded.registered_utc",
+                (user_id, display_name, iso(now_utc()))
+            )
+            repaired += 1
+
+        await db.commit()
+
+    await interaction.followup.send(f"✅ Repaired registration for {repaired} players.")
