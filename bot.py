@@ -403,7 +403,7 @@ async def compute_session_scores(season: int, round_: int, session: str) -> bool
             (season, round_, session),
         )
         result_rows = await cur.fetchall()
-        if len(result_rows) < 22:
+        if not result_rows:
             return False
 
         actual_pos_of = {drv: pos for pos, drv in result_rows}
@@ -645,7 +645,7 @@ async def background_loop(bot: discord.Client):
                     continue
 
                 order = await fetch_results_order(season, rnd, sess)
-                if len(order) < 22:
+                if not order:
                     continue
 
                 async with aiosqlite.connect(DB_PATH) as db:
@@ -879,7 +879,7 @@ async def admin_fetch_and_score(interaction: discord.Interaction, season: int, r
     await interaction.response.defer(thinking=True)
     order = await fetch_results_order(season, round, session)
 
-    if len(order) < 22:
+    if not order:
         return await interaction.followup.send("No results available yet.")
 
     async with aiosqlite.connect(DB_PATH) as db:
