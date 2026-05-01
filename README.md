@@ -57,13 +57,13 @@ Scoring:
 
 The bot automatically reminds players to submit predictions.
 
-| Event                  | Reminder Time           |
-| ---------------------- | ----------------------- |
-| Preseason predictions  | 24 hours before lock    |
-| Qualifying predictions | 24 hours before session |
-| Race predictions       | 12 hours before session |
+| Event                  | Reminder Time                          |
+| ---------------------- | -------------------------------------- |
+| Preseason predictions  | 24 hours and 12 hours before lock      |
+| Qualifying predictions | 24 hours and 12 hours before lock      |
+| Race predictions       | 24 hours and 12 hours before lock      |
 
-Reminders ping a configurable **FantasyPlayer role**.
+Reminders ping the configurable league role. The default role name is **f1**.
 
 ---
 
@@ -74,7 +74,8 @@ The bot automatically:
 1. Fetches official results from the **F1 Ergast/Jolpica API**
 2. Stores results in the database
 3. Calculates scores for all players
-4. Posts a leaderboard in Discord
+4. Posts a qualifying or race leaderboard in Discord
+5. Posts overall standings after each race is scored
 
 This happens automatically after:
 
@@ -122,9 +123,9 @@ Players can use:
 
 ---
 
-# 💾 Data Storage
+# 💾 Local Data Storage
 
-The bot uses **SQLite** for storing:
+The bot stores league data locally in **SQLite**:
 
 * player registrations
 * predictions
@@ -132,64 +133,71 @@ The bot uses **SQLite** for storing:
 * scores
 * reminders
 
-Database file:
+Default database file:
 
 ```
-f1fantasy.db
+data/f1fantasy.db
 ```
 
-For production hosting, persistent storage is recommended.
+Local backups are saved automatically every 6 hours and can also be created with `/admin_backup_db`.
+
+Default backup folder:
+
+```
+C:\Users\musta\Documents\f1-discord-bot-backups
+```
 
 ---
 
-# ☁️ Deployment
+# 🖥 Local Server Setup
 
-The bot can run on:
+This version is set up to run from your local machine or local server. The bot reads config from a `.env` file in the project folder, then stores all submitted Discord inputs in the local SQLite database under `data/`.
 
-* Railway
-* Oracle Cloud VM
-* Any Linux server with Python
+Recommended local setup:
 
-Recommended production setup:
+* Python 3.10+
+* A virtual environment
+* A `.env` file copied from `.env.example`
+* Discord Developer Portal **Server Members Intent** enabled if you want `/admin_register_role_members`
 
-* **Oracle Cloud Always Free VM**
-* Persistent storage volume
-* Python virtual environment
-* Systemd service for automatic restart
+If you run this on a home server, keep the project folder on a drive that is backed up. Do not delete the `data/` folder unless you want to remove the league database.
 
 ---
 
-# ⚙️ Environment Variables
+# ⚙️ Local Configuration
 
-Required environment variables:
+Create a `.env` file in this folder:
 
 ```
 DISCORD_TOKEN=your_bot_token
 ADMIN_ROLE=LeagueAdmin
-REMINDER_ROLE=FantasyPlayer
+REMINDER_ROLE=f1
 LEADERBOARD_CHANNEL_ID=channel_id
 REMINDER_CHANNEL_ID=channel_id
 GUILD_ID=server_id
-DB_PATH=/data/f1fantasy.db
 LEAGUE_SEASON=2026
+DATA_DIR=data
+# DB_PATH=data/f1fantasy.db
+# BACKUP_DIR=C:\Users\musta\Documents\f1-discord-bot-backups
 ```
+
+`DB_PATH` and `BACKUP_DIR` are optional. If you leave them unset, the bot uses `data/f1fantasy.db` and `C:\Users\musta\Documents\f1-discord-bot-backups`.
 
 ---
 
 # 🛠 Installation
 
-Clone the repository:
+Open PowerShell in this project folder:
 
 ```
-git clone https://github.com/yourusername/f1-fantasy-bot.git
-cd f1-fantasy-bot
+cd C:\Users\musta\Downloads\f1-discord-bot-main
 ```
 
-Create virtual environment:
+Create and activate a virtual environment:
 
 ```
-python3 -m venv .venv
-source .venv/bin/activate
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
 Install dependencies:
@@ -204,17 +212,25 @@ Run the bot:
 python bot.py
 ```
 
+You can also double-click `run_local.bat` after creating `.env` and installing dependencies once.
+
 ---
 
 # 📅 First Time Setup
 
-After starting the bot, run:
+After the bot starts, run this in Discord:
 
 ```
 /sync_schedule season:2026
 ```
 
 This loads all qualifying and race sessions into the database.
+
+To confirm data is local, check that this file exists after startup:
+
+```
+data/f1fantasy.db
+```
 
 ---
 
@@ -225,6 +241,7 @@ This loads all qualifying and race sessions into the database.
 * SQLite
 * aiohttp
 * aiosqlite
+* local `.env` config
 * F1 Ergast / Jolpica API
 
 ---
