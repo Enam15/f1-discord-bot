@@ -1,40 +1,88 @@
 import os
 import asyncio
-import json
-import tempfile
+import sqlite3
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import List
 
 import aiohttp
 import aiosqlite
 import discord
 from discord import app_commands
-from pydrive2.auth import GoogleAuth
-from pydrive2.drive import GoogleDrive
 
 # =======================
 # CONFIG
 # =======================
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / ".env"
+
+
+def load_local_env(path: Path = ENV_PATH) -> None:
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+
+        os.environ[key] = value
+
+
+def env_int(name: str, default=None):
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer.") from exc
+
+
+def resolve_local_path(value, default) -> Path:
+    path = Path(value or default).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path
+
+
+load_local_env()
+
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 ADMIN_ROLE = os.getenv("ADMIN_ROLE", "LeagueAdmin")
-REMINDER_ROLE = os.getenv("REMINDER_ROLE", "FantasyPlayer")
+REMINDER_ROLE = os.getenv("REMINDER_ROLE", "f1")
 
-LEADERBOARD_CHANNEL_ID = int(os.getenv("LEADERBOARD_CHANNEL_ID")) if os.getenv("LEADERBOARD_CHANNEL_ID") else None
-REMINDER_CHANNEL_ID = int(os.getenv("REMINDER_CHANNEL_ID")) if os.getenv("REMINDER_CHANNEL_ID") else None
-GUILD_ID = int(os.getenv("GUILD_ID")) if os.getenv("GUILD_ID") else None
+LEADERBOARD_CHANNEL_ID = env_int("LEADERBOARD_CHANNEL_ID")
+REMINDER_CHANNEL_ID = env_int("REMINDER_CHANNEL_ID")
+GUILD_ID = env_int("GUILD_ID")
 
 JOLPICA_BASE = os.getenv("JOLPICA_BASE", "https://api.jolpi.ca/ergast/f1")
-DB_PATH = os.getenv("DB_PATH", "f1fantasy.db")
-LEAGUE_SEASON = int(os.getenv("LEAGUE_SEASON", "2026"))
+DATA_DIR = resolve_local_path(os.getenv("DATA_DIR"), BASE_DIR / "data")
+DB_FILE = resolve_local_path(os.getenv("DB_PATH"), DATA_DIR / "f1fantasy.db")
+BACKUP_DIR = resolve_local_path(os.getenv("BACKUP_DIR"), Path.home() / "Documents" / "f1-discord-bot-backups")
+LEAGUE_SEASON = env_int("LEAGUE_SEASON", 2026)
 
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-if os.path.dirname(DB_PATH):
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+DB_PATH = str(DB_FILE)
 
-BDT = ZoneInfo("Asia/Dhaka")
+try:
+    BDT = ZoneInfo("Asia/Dhaka")
+except ZoneInfoNotFoundError:
+    BDT = timezone(timedelta(hours=6), "Asia/Dhaka")
 PRESEASON_LOCK_BDT = datetime(2026, 3, 5, 23, 59, 0, tzinfo=BDT)
 PRESEASON_LOCK_UTC = PRESEASON_LOCK_BDT.astimezone(timezone.utc)
 
@@ -44,9 +92,10 @@ SESSION_RESULT_DELAY = {
     "race": timedelta(hours=4),
 }
 
-PRESEASON_REMINDER_BEFORE = timedelta(hours=24)
-QUALI_REMINDER_BEFORE = timedelta(hours=24)
-RACE_REMINDER_BEFORE = timedelta(hours=12)
+REMINDER_SCHEDULE = (
+    ("24h", "24 hours", timedelta(hours=24)),
+    ("12h", "12 hours", timedelta(hours=12)),
+)
 BACKUP_INTERVAL = timedelta(hours=6)
 
 
@@ -99,50 +148,45 @@ def preseason_locked() -> bool:
     return now_utc() >= PRESEASON_LOCK_UTC
 
 
+def reminder_window_open(lock_time: datetime, offset: timedelta, next_offset: timedelta | None) -> bool:
+    window_start = lock_time - offset
+    window_end = lock_time - next_offset if next_offset else lock_time
+    current_time = now_utc()
+    return window_start <= current_time < window_end
+
+
+def find_role_by_name(guild: discord.Guild, role_name: str):
+    exact = discord.utils.get(guild.roles, name=role_name)
+    if exact:
+        return exact
+
+    target = role_name.casefold()
+    return discord.utils.find(lambda role: role.name.casefold() == target, guild.roles)
+
+
 # =======================
-# GOOGLE DRIVE BACKUP
+# LOCAL BACKUP
 # =======================
-def get_drive():
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
+def create_local_backup() -> Path:
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = now_utc().strftime("%Y%m%d_%H%M%S")
+    backup_file = BACKUP_DIR / f"f1fantasy_backup_{timestamp}.db"
 
-    creds = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    with sqlite3.connect(DB_PATH) as source:
+        with sqlite3.connect(str(backup_file)) as destination:
+            source.backup(destination)
 
-    with tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".json") as f:
-        json.dump(creds, f)
-        key_path = f.name
-
-    gauth = GoogleAuth()
-    gauth.settings["client_config_backend"] = "service"
-    gauth.settings["service_config"] = {
-        "client_json_file_path": key_path,
-        "client_user_email": creds["client_email"],
-        "client_json_dict": creds,
-    }
-
-    gauth.ServiceAuth()
-    return GoogleDrive(gauth)
+    return backup_file
 
 
-async def backup_database_to_drive():
-    if not GOOGLE_DRIVE_FOLDER_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
-        return False, "Google Drive backup not configured"
-
-    if not os.path.exists(DB_PATH):
-        return False, f"Database file not found at {DB_PATH}"
+async def backup_database_locally():
+    if not DB_FILE.exists():
+        return False, f"Database file not found at {DB_FILE}"
 
     try:
-        drive = get_drive()
-
-        file = drive.CreateFile({
-            "title": f"f1fantasy_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db",
-            "parents": [{"id": GOOGLE_DRIVE_FOLDER_ID}]
-        })
-        file.SetContentFile(DB_PATH)
-        file.Upload()
-
-        print("Database backup uploaded to Google Drive")
-        return True, "Backup uploaded"
+        backup_file = await asyncio.to_thread(create_local_backup)
+        print(f"Database backup saved to {backup_file}")
+        return True, str(backup_file)
     except Exception as e:
         print("Backup failed:", e)
         return False, str(e)
@@ -360,13 +404,15 @@ async def sync_schedule(season: int):
                 q = r["Qualifying"]
                 qdt = datetime.fromisoformat(f"{q['date']}T{q['time'].replace('Z', '+00:00')}")
                 await db.execute(
-                    "INSERT OR REPLACE INTO events(season, round, session, start_utc, locked, scored) VALUES(?, ?, 'quali', ?, 0, 0)",
+                    "INSERT INTO events(season, round, session, start_utc, locked, scored) VALUES(?, ?, 'quali', ?, 0, 0) "
+                    "ON CONFLICT(season, round, session) DO UPDATE SET start_utc=excluded.start_utc",
                     (season, rnd, iso(qdt)),
                 )
 
             rdt = datetime.fromisoformat(f"{r['date']}T{r['time'].replace('Z', '+00:00')}")
             await db.execute(
-                "INSERT OR REPLACE INTO events(season, round, session, start_utc, locked, scored) VALUES(?, ?, 'race', ?, 0, 0)",
+                "INSERT INTO events(season, round, session, start_utc, locked, scored) VALUES(?, ?, 'race', ?, 0, 0) "
+                "ON CONFLICT(season, round, session) DO UPDATE SET start_utc=excluded.start_utc",
                 (season, rnd, iso(rdt)),
             )
 
@@ -501,7 +547,7 @@ async def send_role_reminder(bot: discord.Client, message: str):
     if not channel:
         return
 
-    role = discord.utils.get(channel.guild.roles, name=REMINDER_ROLE)
+    role = find_role_by_name(channel.guild, REMINDER_ROLE)
     content = f"{role.mention}\n\n{message}" if role else message
 
     await channel.send(
@@ -536,12 +582,49 @@ async def post_leaderboard(bot: discord.Client, season: int, round_: int, sessio
     await channel.send(f"🏁 **{season} Round {round_} — {session.upper()} Leaderboard**\n{msg}")
 
 
+async def get_overall_standings_rows(season: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT p.display_name, COALESCE(SUM(s.points), 0) AS pts
+            FROM players p
+            LEFT JOIN scores s ON s.user_id=p.user_id AND s.season=?
+            WHERE p.registered=1
+            GROUP BY p.user_id
+            ORDER BY pts DESC, p.display_name ASC
+        """, (season,))
+        return await cur.fetchall()
+
+
+async def post_overall_standings(bot: discord.Client, season: int, round_: int | None = None):
+    if not LEADERBOARD_CHANNEL_ID:
+        return
+
+    channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
+    if not channel:
+        return
+
+    rows = await get_overall_standings_rows(season)
+    if not rows:
+        await channel.send(f"🏆 **{season} Overall Standings**\nNo standings yet.")
+        return
+
+    msg = "\n".join([f"**{i}. {name}** — {pts} pts" for i, (name, pts) in enumerate(rows, 1)])
+    if round_ is None:
+        title = f"🏆 **{season} Overall Standings**"
+    else:
+        title = f"🏆 **{season} Overall Standings After Round {round_}**"
+
+    await channel.send(f"{title}\n{msg}")
+
+
 # =======================
 # DISCORD CLIENT
 # =======================
 class Client(discord.Client):
     def __init__(self):
-        super().__init__(intents=discord.Intents.default())
+        intents = discord.Intents.default()
+        intents.members = True
+        super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
@@ -569,22 +652,25 @@ async def background_loop(bot: discord.Client):
 
     while not bot.is_closed():
         try:
-            # Google Drive backup
+            # Local SQLite backup
             if not last_backup or now_utc() - last_backup > BACKUP_INTERVAL:
-                await backup_database_to_drive()
+                await backup_database_locally()
                 last_backup = now_utc()
 
-            # Preseason 24h reminder
-            preseason_reminder_time = PRESEASON_LOCK_UTC - PRESEASON_REMINDER_BEFORE
-            if preseason_reminder_time <= now_utc() < PRESEASON_LOCK_UTC:
-                if not await reminder_sent(LEAGUE_SEASON, 0, "preseason", "24h"):
+            # Preseason reminders
+            for index, (reminder_key, reminder_label, offset) in enumerate(REMINDER_SCHEDULE):
+                next_offset = REMINDER_SCHEDULE[index + 1][2] if index + 1 < len(REMINDER_SCHEDULE) else None
+                if not reminder_window_open(PRESEASON_LOCK_UTC, offset, next_offset):
+                    continue
+
+                if not await reminder_sent(LEAGUE_SEASON, 0, "preseason", reminder_key):
                     await send_role_reminder(
                         bot,
                         "⏰ **Preseason Reminder**\n"
-                        "There are **24 hours left** before preseason predictions lock.\n"
+                        f"Entries close in **{reminder_label}**.\n"
                         f"Use `/register_preseason season:{LEAGUE_SEASON} drivers:<22 drivers> constructors:<11 teams>`"
                     )
-                    await mark_reminder_sent(LEAGUE_SEASON, 0, "preseason", "24h")
+                    await mark_reminder_sent(LEAGUE_SEASON, 0, "preseason", reminder_key)
 
             # Load all events
             async with aiosqlite.connect(DB_PATH) as db:
@@ -605,32 +691,22 @@ async def background_loop(bot: discord.Client):
             # Session reminders
             for season, rnd, sess, start_utc, locked, scored in events:
                 start_dt = from_iso(start_utc)
+                session_label = "Qualifying" if sess == "quali" else "Race"
 
-                if sess == "quali":
-                    reminder_time = start_dt - QUALI_REMINDER_BEFORE
-                    if reminder_time <= now_utc() < start_dt:
-                        if not await reminder_sent(season, rnd, sess, "24h"):
-                            await send_role_reminder(
-                                bot,
-                                f"⏰ **Qualifying Reminder**\n"
-                                f"Round **{rnd} Qualifying** starts in **24 hours**.\n"
-                                f"Lock in your prediction with:\n"
-                                f"`/predict season:{season} round:{rnd} session:quali grid:<22 drivers>`"
-                            )
-                            await mark_reminder_sent(season, rnd, sess, "24h")
+                for index, (reminder_key, reminder_label, offset) in enumerate(REMINDER_SCHEDULE):
+                    next_offset = REMINDER_SCHEDULE[index + 1][2] if index + 1 < len(REMINDER_SCHEDULE) else None
+                    if not reminder_window_open(start_dt, offset, next_offset):
+                        continue
 
-                elif sess == "race":
-                    reminder_time = start_dt - RACE_REMINDER_BEFORE
-                    if reminder_time <= now_utc() < start_dt:
-                        if not await reminder_sent(season, rnd, sess, "12h"):
-                            await send_role_reminder(
-                                bot,
-                                f"⏰ **Race Reminder**\n"
-                                f"Round **{rnd} Race** starts in **12 hours**.\n"
-                                f"Lock in your prediction with:\n"
-                                f"`/predict season:{season} round:{rnd} session:race grid:<22 drivers>`"
-                            )
-                            await mark_reminder_sent(season, rnd, sess, "12h")
+                    if not await reminder_sent(season, rnd, sess, reminder_key):
+                        await send_role_reminder(
+                            bot,
+                            f"⏰ **{session_label} Reminder**\n"
+                            f"Round **{rnd} {session_label}** entries close in **{reminder_label}**.\n"
+                            f"Lock in your prediction with:\n"
+                            f"`/predict season:{season} round:{rnd} session:{sess} grid:<22 drivers>`"
+                        )
+                        await mark_reminder_sent(season, rnd, sess, reminder_key)
 
             # Auto-fetch and score
             async with aiosqlite.connect(DB_PATH) as db:
@@ -664,6 +740,8 @@ async def background_loop(bot: discord.Client):
                 ok = await compute_session_scores(season, rnd, sess)
                 if ok:
                     await post_leaderboard(bot, season, rnd, sess)
+                    if sess == "race":
+                        await post_overall_standings(bot, season, rnd)
 
         except Exception as e:
             print("BACKGROUND LOOP ERROR:", e)
@@ -677,6 +755,7 @@ async def background_loop(bot: discord.Client):
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (id={client.user.id})")
+    print(f"SQLite database: {DB_FILE}")
 
 
 # =======================
@@ -780,16 +859,7 @@ async def predict(interaction: discord.Interaction, season: int, round: int, ses
 
 @client.tree.command(name="standings", description="Overall standings (quali + race totals)")
 async def standings(interaction: discord.Interaction, season: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT p.display_name, COALESCE(SUM(s.points), 0) AS pts
-            FROM players p
-            LEFT JOIN scores s ON s.user_id=p.user_id AND s.season=?
-            WHERE p.registered=1
-            GROUP BY p.user_id
-            ORDER BY pts DESC, p.display_name ASC
-        """, (season,))
-        rows = await cur.fetchall()
+    rows = await get_overall_standings_rows(season)
 
     if not rows:
         return await interaction.response.send_message("No standings yet.")
@@ -1014,15 +1084,26 @@ async def admin_register_role_members(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("This command must be used in a server.")
 
-    role = discord.utils.get(interaction.guild.roles, name=REMINDER_ROLE)
+    role = find_role_by_name(interaction.guild, REMINDER_ROLE)
     if not role:
         return await interaction.response.send_message(f"Role `{REMINDER_ROLE}` not found.")
 
     await interaction.response.defer(thinking=True)
     registered_count = 0
+    members = list(role.members)
+
+    if not members:
+        try:
+            members = [member async for member in interaction.guild.fetch_members(limit=None) if role in member.roles]
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "I need the Discord Server Members Intent enabled to read role members."
+            )
+        except discord.HTTPException as exc:
+            return await interaction.followup.send(f"Could not fetch server members: {exc}")
 
     async with aiosqlite.connect(DB_PATH) as db:
-        for member in role.members:
+        for member in members:
             if member.bot:
                 continue
 
@@ -1196,21 +1277,26 @@ async def admin_delete_preseason(interaction: discord.Interaction, user: discord
     await interaction.response.send_message(f"🗑️ Deleted {user.display_name}'s preseason predictions for {season}.")
 
 
-@client.tree.command(name="admin_backup_db", description="Admin: backup database to Google Drive")
+@client.tree.command(name="admin_backup_db", description="Admin: backup database locally")
 async def admin_backup_db(interaction: discord.Interaction):
     if not await is_admin(interaction):
         return await interaction.response.send_message("Admin only.")
 
     await interaction.response.defer(thinking=True)
-    ok, msg = await backup_database_to_drive()
+    ok, msg = await backup_database_locally()
 
     if ok:
-        await interaction.followup.send("✅ Database backup uploaded to Google Drive.")
+        await interaction.followup.send(f"✅ Database backup saved locally: `{msg}`")
     else:
         await interaction.followup.send(f"❌ Backup failed: {msg}")
 
 
-if not DISCORD_TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN env var.")
+def main():
+    if not DISCORD_TOKEN:
+        raise RuntimeError("Missing DISCORD_TOKEN env var.")
 
-client.run(DISCORD_TOKEN)
+    client.run(DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    main()
