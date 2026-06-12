@@ -93,8 +93,9 @@ SESSION_RESULT_DELAY = {
 }
 
 REMINDER_SCHEDULE = (
-    ("24h", "24 hours", timedelta(hours=24)),
-    ("12h", "12 hours", timedelta(hours=12)),
+    ("24h", timedelta(hours=24)),
+    ("12h", timedelta(hours=12)),
+    ("1h", timedelta(hours=1)),
 )
 BACKUP_INTERVAL = timedelta(hours=6)
 
@@ -148,11 +149,20 @@ def preseason_locked() -> bool:
     return now_utc() >= PRESEASON_LOCK_UTC
 
 
-def reminder_window_open(lock_time: datetime, offset: timedelta, next_offset: timedelta | None) -> bool:
-    window_start = lock_time - offset
-    window_end = lock_time - next_offset if next_offset else lock_time
-    current_time = now_utc()
-    return window_start <= current_time < window_end
+def format_time_left(remaining: timedelta) -> str:
+    # Round up to the whole minute so a check made just after a threshold
+    # still reads as the threshold (23:59:10 left -> "24 hours").
+    total_minutes = int(-(-remaining.total_seconds() // 60))
+    if total_minutes < 1:
+        total_minutes = 1
+
+    hours, minutes = divmod(total_minutes, 60)
+    parts = []
+    if hours:
+        parts.append("1 hour" if hours == 1 else f"{hours} hours")
+    if minutes:
+        parts.append("1 minute" if minutes == 1 else f"{minutes} minutes")
+    return " ".join(parts)
 
 
 def find_role_by_name(guild: discord.Guild, role_name: str):
@@ -539,6 +549,30 @@ async def compute_preseason_scores(season: int, category: str) -> bool:
 # =======================
 # REMINDERS / POSTS
 # =======================
+async def pending_reminder(season: int, round_: int, session: str, lock_time: datetime):
+    """Return (time_left_text, unsent_keys) when a reminder is due, else None.
+
+    A tier (24h/12h/1h) becomes due the moment its threshold is crossed. If the
+    bot was offline when a threshold passed, the reminder goes out on the next
+    check with the actual time remaining (e.g. an "18 hours" reminder replaces
+    a missed 24 hour one). One message covers every crossed tier, so coming
+    back online never floods the channel with stacked reminders.
+    """
+    remaining = lock_time - now_utc()
+    if remaining <= timedelta(0):
+        return None
+
+    due_keys = [key for key, offset in REMINDER_SCHEDULE if remaining <= offset]
+    if not due_keys:
+        return None
+
+    unsent_keys = [key for key in due_keys if not await reminder_sent(season, round_, session, key)]
+    if not unsent_keys:
+        return None
+
+    return format_time_left(remaining), unsent_keys
+
+
 async def send_role_reminder(bot: discord.Client, message: str):
     if not REMINDER_CHANNEL_ID:
         return
@@ -658,18 +692,16 @@ async def background_loop(bot: discord.Client):
                 last_backup = now_utc()
 
             # Preseason reminders
-            for index, (reminder_key, reminder_label, offset) in enumerate(REMINDER_SCHEDULE):
-                next_offset = REMINDER_SCHEDULE[index + 1][2] if index + 1 < len(REMINDER_SCHEDULE) else None
-                if not reminder_window_open(PRESEASON_LOCK_UTC, offset, next_offset):
-                    continue
-
-                if not await reminder_sent(LEAGUE_SEASON, 0, "preseason", reminder_key):
-                    await send_role_reminder(
-                        bot,
-                        "⏰ **Preseason Reminder**\n"
-                        f"Entries close in **{reminder_label}**.\n"
-                        f"Use `/register_preseason season:{LEAGUE_SEASON} drivers:<22 drivers> constructors:<11 teams>`"
-                    )
+            pending = await pending_reminder(LEAGUE_SEASON, 0, "preseason", PRESEASON_LOCK_UTC)
+            if pending:
+                time_left, reminder_keys = pending
+                await send_role_reminder(
+                    bot,
+                    "⏰ **Preseason Reminder**\n"
+                    f"Entries close in **{time_left}**.\n"
+                    f"Use `/register_preseason season:{LEAGUE_SEASON} drivers:<22 drivers> constructors:<11 teams>`"
+                )
+                for reminder_key in reminder_keys:
                     await mark_reminder_sent(LEAGUE_SEASON, 0, "preseason", reminder_key)
 
             # Load all events
@@ -693,19 +725,17 @@ async def background_loop(bot: discord.Client):
                 start_dt = from_iso(start_utc)
                 session_label = "Qualifying" if sess == "quali" else "Race"
 
-                for index, (reminder_key, reminder_label, offset) in enumerate(REMINDER_SCHEDULE):
-                    next_offset = REMINDER_SCHEDULE[index + 1][2] if index + 1 < len(REMINDER_SCHEDULE) else None
-                    if not reminder_window_open(start_dt, offset, next_offset):
-                        continue
-
-                    if not await reminder_sent(season, rnd, sess, reminder_key):
-                        await send_role_reminder(
-                            bot,
-                            f"⏰ **{session_label} Reminder**\n"
-                            f"Round **{rnd} {session_label}** entries close in **{reminder_label}**.\n"
-                            f"Lock in your prediction with:\n"
-                            f"`/predict season:{season} round:{rnd} session:{sess} grid:<22 drivers>`"
-                        )
+                pending = await pending_reminder(season, rnd, sess, start_dt)
+                if pending:
+                    time_left, reminder_keys = pending
+                    await send_role_reminder(
+                        bot,
+                        f"⏰ **{session_label} Reminder**\n"
+                        f"Round **{rnd} {session_label}** entries close in **{time_left}**.\n"
+                        f"Lock in your prediction with:\n"
+                        f"`/predict season:{season} round:{rnd} session:{sess} grid:<22 drivers>`"
+                    )
+                    for reminder_key in reminder_keys:
                         await mark_reminder_sent(season, rnd, sess, reminder_key)
 
             # Auto-fetch and score
